@@ -19,6 +19,10 @@ export const addProvider = async (data: any, opts?: CallOpts) => {
   return await request.post('/add_provider', data, cfg(opts))
 }
 
+export const deleteProviderById = async (id: string, opts?: CallOpts) => {
+  return await request.post(`/delete_provider/${id}`, {}, cfg(opts))
+}
+
 export const testConnection = async (data: any, opts?: CallOpts) => {
   return await request.post('/connect_test', data, cfg(opts))
 }
@@ -31,8 +35,15 @@ export const fetchEnableModelById = async (id: string) => {
   return await request.get('/model_enable/' + id)
 }
 
+export type ThinkingConfig = {
+  mode: 'off' | 'on' | 'inherit'
+  capability: 'toggleable' | 'forced_on' | 'forced_off' | 'unknown'
+  strategy: string
+  notes?: string
+}
+
 export async function addModel(
-  data: { provider_id: string; model_name: string },
+  data: { provider_id: string; model_name: string; thinking?: ThinkingConfig },
   opts?: CallOpts,
 ) {
   return request.post('/models', data, cfg(opts))
@@ -44,4 +55,18 @@ export const fetchEnableModels = async () => {
 
 export const deleteModelById = async (modelId: number) => {
   return await request.get(`/models/delete/${modelId}`)
+}
+
+export const fetchThinkingProfile = async (modelName: string) => {
+  return await request.get('/models/thinking_profile', {
+    params: { model_name: modelName },
+  })
+}
+
+export const updateModelThinking = async (
+  modelId: number | string,
+  thinking: Partial<ThinkingConfig>,
+  opts?: CallOpts,
+) => {
+  return await request.post(`/models/${modelId}/thinking`, { thinking }, cfg(opts))
 }

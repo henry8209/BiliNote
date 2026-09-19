@@ -49,6 +49,13 @@ class WhisperTranscriber(Transcriber):
 
         self.compute_type = compute_type or ("float16" if self.device == "cuda" else "int8")
         self.model_size = model_size
+        # 峰值控制：默认 3 核（4 核机留 1 核给系统/其他容器）。
+        # 2 核会明显变慢；4 核会把整机打满。可用 WHISPER_CPU_THREADS 覆盖。
+        try:
+            self.cpu_threads = int(os.getenv("WHISPER_CPU_THREADS", str(cpu_threads or 3)))
+        except ValueError:
+            self.cpu_threads = 3
+        self.cpu_threads = max(1, min(self.cpu_threads, 4))
 
         model_dir = get_model_dir("whisper")
         try:
@@ -64,11 +71,17 @@ class WhisperTranscriber(Transcriber):
         # 直通的 repo_id 或本地路径。faster-whisper 对本地目录走 os.path.isdir 分支，
         # 对 repo_id 走 download_model(cache_dir=download_root)，两者都吃 model_size_or_path。
         target = resolve_whisper_model(model_size)
+        logger.info(
+            f"WhisperModel device={self.device} size={model_size} "
+            f"cpu_threads={self.cpu_threads} compute_type={self.compute_type}"
+        )
         return WhisperModel(
             model_size_or_path=target,
             device=self.device,
             compute_type=self.compute_type,
             download_root=model_dir,
+            cpu_threads=self.cpu_threads,
+            num_workers=1,
         )
 
     @staticmethod
@@ -122,7 +135,6 @@ class WhisperTranscriber(Transcriber):
     @timeit
     def transcript(self, file_path: str) -> TranscriptResult:
         try:
-
             segments_raw, info = self.model.transcribe(file_path)
 
             segments = []
@@ -137,16 +149,22 @@ class WhisperTranscriber(Transcriber):
                     text=text
                 ))
 
-            result= TranscriptResult(
+            # raw 必须可 JSON 序列化；info 是对象，不能直接塞进 asdict/json
+            raw = {
+                "language": getattr(info, "language", None),
+                "language_probability": getattr(info, "language_probability", None),
+                "duration": getattr(info, "duration", None),
+            }
+            result = TranscriptResult(
                 language=info.language,
                 full_text=full_text.strip(),
                 segments=segments,
-                raw=info
+                raw=raw,
             )
-            # self.on_finish(file_path, result)
             return result
         except Exception as e:
-            print(f"转写失败：{e}")
+            logger.error(f"转写失败：{e}")
+            raise
 
 
     def on_finish(self,video_path:str,result: TranscriptResult)->None:

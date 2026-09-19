@@ -327,3 +327,7 @@ cython_debug/
 # FFmpeg 构建文件（不应该提交到仓库）
 ffmpeg*/
 ffmpg*/
+tmp_*.py
+tmp_*.sh
+tmp_*.plist
+

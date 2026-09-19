@@ -11,16 +11,36 @@ from pathlib import Path
 from app.gpt.prompt import BASE_PROMPT, AI_SUM, SCREENSHOT, LINK, MERGE_PROMPT
 from app.gpt.utils import fix_markdown
 from app.gpt.request_chunker import RequestChunker
+from app.gpt.thinking_profiles import (
+    apply_thinking_to_kwargs,
+    normalize_thinking,
+    resolve_want_thinking,
+)
 from app.models.transcriber_model import TranscriptSegment
 from datetime import timedelta
-from typing import List
+from typing import Any, Dict, List, Optional
 
 
 class UniversalGPT(GPT):
-    def __init__(self, client, model: str, temperature: float = 0.7):
+    def __init__(
+        self,
+        client,
+        model: str,
+        temperature: float = 0.7,
+        thinking: Optional[Dict[str, Any]] = None,
+        reasoning_effort: Optional[str] = None,
+    ):
         self.client = client
         self.model = model
         self.temperature = temperature
+        self.thinking = normalize_thinking(thinking, model_name=model)
+        # legacy: map reasoning_effort into thinking if provided alone
+        self.reasoning_effort = reasoning_effort
+        if reasoning_effort and not (thinking or {}).get("strategy"):
+            self.thinking = normalize_thinking(
+                {"thinking": self.thinking, "reasoning_effort": reasoning_effort},
+                model_name=model,
+            )
         self.screenshot = False
         self.link = False
         self.max_request_bytes = int(os.getenv("OPENAI_MAX_REQUEST_BYTES", str(45 * 1024 * 1024)))
@@ -196,22 +216,60 @@ class UniversalGPT(GPT):
             or "only the default" in raw
         )
 
+    def _create_kwargs(self, messages: list, include_temperature: bool = True) -> dict:
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+        }
+        if include_temperature:
+            kwargs["temperature"] = self.temperature
+        kwargs = apply_thinking_to_kwargs(kwargs, self.thinking)
+        # legacy reasoning_effort passthrough when strategy uses it and value set
+        if self.reasoning_effort and self.thinking.get("strategy") == "openai_reasoning_effort":
+            if resolve_want_thinking(self.thinking):
+                kwargs["reasoning_effort"] = self.reasoning_effort
+            else:
+                kwargs["reasoning_effort"] = "none"
+        return kwargs
+
     def _do_create(self, messages: list):
-        """单次调用。如果模型拒绝自定义 temperature，就地去掉该参数再试一次
-        （不消耗外层的重试次数预算），仍失败则把异常抛给外层重试逻辑。"""
+        """单次调用。处理 temperature / thinking 参数不被接受的情况。"""
         try:
             return self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
+                **self._create_kwargs(messages, include_temperature=True)
             )
         except Exception as exc:
             if self._is_temperature_unsupported_error(exc):
                 print(f"[universal_gpt] 模型 {self.model} 不支持自定义 temperature，改用默认值重试")
                 return self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
+                    **self._create_kwargs(messages, include_temperature=False)
                 )
+            msg = str(exc)
+            msg_l = msg.lower()
+            if "enable_thinking" in msg_l or ("thinking" in msg_l and "invalid" in msg_l):
+                if "restricted to true" in msg_l or "restricted to True" in msg:
+                    print(
+                        f"[universal_gpt] 警告：模型 {self.model} 强制开启推理(thinking)，"
+                        f"无法关闭。笔记会较慢。建议改用可关闭 thinking 的模型（例如 qwen3.7-flash）。"
+                    )
+                else:
+                    print(
+                        f"[universal_gpt] 模型 {self.model} 不接受当前 thinking 参数，"
+                        f"去掉后重试（可能仍走默认推理）。"
+                    )
+                kwargs = {
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": self.temperature,
+                }
+                try:
+                    return self.client.chat.completions.create(**kwargs)
+                except Exception as exc2:
+                    if self._is_temperature_unsupported_error(exc2):
+                        return self.client.chat.completions.create(
+                            model=self.model, messages=messages
+                        )
+                    raise
             raise
 
     def _chat_completion_create(self, messages: list):

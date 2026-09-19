@@ -115,15 +115,25 @@ def update_provider(id: str, **kwargs):
         db.close()
 
 
-def delete_provider(id: str):
+def delete_provider(id: str) -> bool:
+    """删除供应商；同时清理其下模型。返回是否删除成功。"""
+    from app.db.models.models import Model
+
     db = next(get_db())
     try:
         provider = db.query(Provider).filter_by(id=id).first()
-        if provider:
-            db.delete(provider)
-            db.commit()
-            logger.info(f"Provider deleted successfully. id: {id}")
+        if not provider:
+            logger.warning(f"Provider {id} not found for delete.")
+            return False
+        # 先删关联模型，避免脏数据
+        db.query(Model).filter_by(provider_id=id).delete(synchronize_session=False)
+        db.delete(provider)
+        db.commit()
+        logger.info(f"Provider deleted successfully. id: {id}")
+        return True
     except Exception as e:
+        db.rollback()
         logger.error(f"Failed to delete provider: {e}")
+        return False
     finally:
         db.close()

@@ -18,11 +18,30 @@ export default function VideoBanner({ audioMeta, videoUrl }: VideoBannerProps) {
   if (!audioMeta) return null
 
   const rawCover = audioMeta.cover_url
-  // 通过后端代理加载封面，避免跨域/Referrer 限制
   const apiBase = String(import.meta.env.VITE_API_BASE_URL || 'api').replace(/\/$/, '')
-  const coverUrl = rawCover
-    ? `${apiBase}/image_proxy?url=${encodeURIComponent(rawCover)}`
+  const localCover = rawCover
+    ? (rawCover.startsWith('/static/') || rawCover.startsWith('/uploads/')
+        ? rawCover
+        : (() => {
+            try {
+              const u = new URL(rawCover)
+              if (
+                (u.hostname === 'localhost' || u.hostname === '127.0.0.1') &&
+                u.pathname.startsWith('/static/')
+              ) {
+                return u.pathname
+              }
+            } catch {
+              /* ignore */
+            }
+            return ''
+          })())
     : ''
+  const coverUrl = localCover
+    ? localCover
+    : rawCover
+      ? `${apiBase}/image_proxy?url=${encodeURIComponent(rawCover)}`
+      : ''
   const title = audioMeta.title
   const uploader = audioMeta.raw_info?.uploader || ''
   const platform = platformLabel[audioMeta.platform] || audioMeta.platform || ''

@@ -45,6 +45,13 @@ export interface Task {
   status: TaskStatus
   audioMeta: AudioMeta
   createdAt: string
+  /** 后端返回的失败原因（例如阿里云 data_inspection_failed） */
+  errorMessage?: string
+  /** 进行中状态说明（例如 Whisper 转写耗时提示） */
+  statusMessage?: string
+  pipeline?: string
+  pipelineLabel?: string
+  etaSeconds?: number
   formData: {
     video_url: string
     link: undefined | boolean

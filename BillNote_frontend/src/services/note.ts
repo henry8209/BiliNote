@@ -61,15 +61,10 @@ export const delete_task = async ({ video_id, platform }) => {
 
 export const get_task_status = async (task_id: string) => {
   try {
-    // 成功提示
-
-    return await request.get('/task_status/' + task_id)
+    return await request.get('/task_status/' + task_id, { suppressToast: true })
   } catch (e) {
+    // 失败细节由 useTaskPolling 统一 toast，避免重复弹「请稍后重试」
     console.error('❌ 请求出错', e)
-
-    // 错误提示
-    toast.error('笔记生成失败，请稍后重试')
-
-    throw e // 抛出错误以便调用方处理
+    throw e
   }
 }

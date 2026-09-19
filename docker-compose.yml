@@ -15,6 +15,15 @@ services:
     environment:
       - BACKEND_PORT=${BACKEND_PORT}
       - BACKEND_HOST=${BACKEND_HOST}
+      # 限制 faster-whisper / OpenMP 峰值，避免单次转写打满 4 核
+      - WHISPER_CPU_THREADS=${WHISPER_CPU_THREADS:-3}
+      - OMP_NUM_THREADS=${WHISPER_CPU_THREADS:-3}
+      - OPENBLAS_NUM_THREADS=${WHISPER_CPU_THREADS:-3}
+      - MKL_NUM_THREADS=${WHISPER_CPU_THREADS:-3}
+      # 内网 MLX Whisper（不出公网）。失败才 fallback 本机 3 核 Whisper
+      - MLX_WHISPER_API_URL=${MLX_WHISPER_API_URL:-http://192.168.8.18:8000}
+      - MLX_WHISPER_TIMEOUT=${MLX_WHISPER_TIMEOUT:-180}
+      - MLX_WHISPER_MODEL=${MLX_WHISPER_MODEL:-mlx-community/whisper-large-v3-turbo}
     volumes:
       # 把整个 backend/ 目录绑到 /app，意味着这些都持久化到宿主机、删容器不丢：
       #   ./backend/bili_note.db                — SQLite 数据库（含 LLM 供应商配置、笔记历史）
@@ -36,6 +45,8 @@ services:
     # WHISPER_MODEL_SIZE 选 medium 及以上请把这里调到 8g+，
     # 否则首次模型加载时容易被 host OOM-killer 干掉。
     mem_limit: 4g
+    # 硬上限 3 核：留 1 核给系统/其他容器；比 2 核快，又不会整机卡死
+    cpus: 3.0
 
   frontend:
     container_name: bilinote-frontend

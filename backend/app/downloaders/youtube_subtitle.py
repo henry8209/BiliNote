@@ -40,7 +40,18 @@ class YouTubeSubtitleFetcher:
         langs: Optional[List[str]] = None,
     ) -> Optional[TranscriptResult]:
         if langs is None:
-            langs = ["zh-Hans", "zh", "zh-CN", "zh-TW", "en", "en-US", "ja"]
+            langs = [
+                "zh-HK",
+                "zh-TW",
+                "zh-Hant",
+                "yue",
+                "zh-Hans",
+                "zh",
+                "zh-CN",
+                "en",
+                "en-US",
+                "ja",
+            ]
 
         try:
             # 1. 列出所有可用字幕
@@ -65,6 +76,9 @@ class YouTubeSubtitleFetcher:
                 except Exception:
                     # 都没匹配，取第一个可用的
                     for t in transcript_list:
+                        code = (t.language_code or "").lower()
+                        if code in ("live_chat", "live-chat"):
+                            continue
                         transcript = t
                         source = "auto" if t.is_generated else "manual"
                         logger.info(f"使用首个可用字幕: {t.language_code} ({source})")
@@ -75,17 +89,24 @@ class YouTubeSubtitleFetcher:
                 return None
 
             # 3. 获取字幕内容
+            # youtube-transcript-api 新版本返回 FetchedTranscriptSnippet 对象，
+            # 旧版本可能是 dict；两种都要兼容，绝不能 str(snippet)（会把对象 repr 写进笔记）。
             fetched = transcript.fetch()
             segments = []
             for snippet in fetched:
-                text = snippet.get("text", "").strip() if isinstance(snippet, dict) else str(snippet).strip()
+                if isinstance(snippet, dict):
+                    text = (snippet.get("text") or "").strip()
+                    start = float(snippet.get("start") or 0)
+                    duration = float(snippet.get("duration") or 0)
+                else:
+                    text = (getattr(snippet, "text", None) or "").strip()
+                    start = float(getattr(snippet, "start", 0) or 0)
+                    duration = float(getattr(snippet, "duration", 0) or 0)
                 if not text:
                     continue
-                start = snippet.get("start", 0) if isinstance(snippet, dict) else 0
-                duration = snippet.get("duration", 0) if isinstance(snippet, dict) else 0
                 segments.append(TranscriptSegment(
-                    start=float(start),
-                    end=float(start) + float(duration),
+                    start=start,
+                    end=start + duration,
                     text=text,
                 ))
 

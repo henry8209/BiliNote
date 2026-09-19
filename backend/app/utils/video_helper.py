@@ -63,7 +63,7 @@ def save_cover_to_static(local_cover_path: str, subfolder: Optional[str] = "cove
     file_name = os.path.basename(local_cover_path)
     target_path = os.path.join(target_dir, file_name)
     shutil.copy2(local_cover_path, target_path)  # 保留原时间戳、权限
+    # 必须返回同源相对路径。写成 http://localhost:8483/... 时，
+    # 浏览器会去用户本机找图，历史封面就会烂掉。
     image_relative_path = f"/static/{subfolder}/{file_name}".replace("\\", "/")
-    url_path = f"{BACKEND_BASE_URL.rstrip('/')}/{image_relative_path.lstrip('/')}"
-    # 返回前端可访问的路径
-    return url_path
+    return image_relative_path

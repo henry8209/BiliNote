@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks, UploadFile, File
+from fastapi import APIRouter, HTTPException, BackgroundTasks, UploadFile, File, Form
 from pydantic import BaseModel, validator, field_validator
 from dataclasses import asdict
 
@@ -165,16 +165,77 @@ def delete_task(data: RecordRequest):
         return R.error(msg=e)
 
 
+def _safe_upload_name(filename: str) -> str:
+    base = os.path.basename(filename or "video.bin").replace("\\", "_").replace("/", "_")
+    if not base:
+        base = "video.bin"
+    return f"{uuid.uuid4().hex[:8]}_{base}"
+
+
 @router.post("/upload")
 async def upload(file: UploadFile = File(...)):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-    file_location = os.path.join(UPLOAD_DIR, file.filename)
+    name = _safe_upload_name(file.filename or "video.bin")
+    file_location = os.path.join(UPLOAD_DIR, name)
 
     with open(file_location, "wb+") as f:
         f.write(await file.read())
 
-    # 假设你静态目录挂载了 /uploads
-    return R.success({"url": f"/uploads/{file.filename}"})
+    return R.success({"url": f"/uploads/{name}"})
+
+
+@router.post("/upload/chunk")
+async def upload_chunk(
+    file: UploadFile = File(...),
+    upload_id: str = Form(...),
+    index: int = Form(...),
+    total: int = Form(...),
+    filename: str = Form(""),
+):
+    """分块上传，绕过 Cloudflare ~100MB 单次请求上限。"""
+    if total < 1 or total > 20000 or index < 0 or index >= total:
+        return R.error(msg="分块参数无效", code=400)
+    safe_id = "".join(c for c in upload_id if c.isalnum() or c in "-_")[:80]
+    if not safe_id:
+        return R.error(msg="upload_id 无效", code=400)
+    chunk_dir = os.path.join(UPLOAD_DIR, ".chunks", safe_id)
+    os.makedirs(chunk_dir, exist_ok=True)
+    part_path = os.path.join(chunk_dir, f"{index:06d}")
+    with open(part_path, "wb") as f:
+        f.write(await file.read())
+    return R.success({"index": index, "total": total})
+
+
+@router.post("/upload/complete")
+def upload_complete(
+    upload_id: str = Form(...),
+    filename: str = Form(...),
+    total: int = Form(...),
+):
+    safe_id = "".join(c for c in upload_id if c.isalnum() or c in "-_")[:80]
+    chunk_dir = os.path.join(UPLOAD_DIR, ".chunks", safe_id)
+    if not os.path.isdir(chunk_dir):
+        return R.error(msg="找不到分块缓存，请重新上传", code=400)
+    name = _safe_upload_name(filename)
+    dest = os.path.join(UPLOAD_DIR, name)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    with open(dest, "wb") as out:
+        for i in range(int(total)):
+            part = os.path.join(chunk_dir, f"{i:06d}")
+            if not os.path.exists(part):
+                return R.error(msg=f"缺少分块 {i}/{total}，请重新上传", code=400)
+            with open(part, "rb") as inf:
+                out.write(inf.read())
+    for i in range(int(total)):
+        try:
+            os.remove(os.path.join(chunk_dir, f"{i:06d}"))
+        except OSError:
+            pass
+    try:
+        os.rmdir(chunk_dir)
+    except OSError:
+        pass
+    return R.success({"url": f"/uploads/{name}"})
 
 
 @router.post("/generate_note")
@@ -199,6 +260,11 @@ def generate_note(data: VideoRequest, background_tasks: BackgroundTasks):
                     },
                 )
 
+        if data.platform == "local" and str(data.video_url).startswith(("http://", "https://")):
+            return R.error(
+                msg="已选择本地视频，但提交的仍是网站链接。请先上传文件后再生成。",
+                code=400,
+            )
         video_id = extract_video_id(data.video_url, data.platform)
         # if not video_id:
         #     raise HTTPException(status_code=400, detail="无法提取视频 ID")
@@ -216,8 +282,17 @@ def generate_note(data: VideoRequest, background_tasks: BackgroundTasks):
             # 正常新建任务
             task_id = str(uuid.uuid4())
 
-        # 统一先写入 PENDING，表示已进入队列等待串行执行
-        NoteGenerator()._update_status(task_id, TaskStatus.PENDING)
+        # 统一先写入 PENDING，并记录本次实际选用的模型（便于排查「选了 A 却打到 B」）
+        logger.info(
+            f"generate_note enqueue task_id={task_id} model_name={data.model_name} "
+            f"provider_id={data.provider_id} retry={bool(data.task_id)}"
+        )
+        NoteGenerator()._update_status(
+            task_id,
+            TaskStatus.PENDING,
+            model_name=data.model_name,
+            provider_id=data.provider_id,
+        )
 
         # 客户端已经抓好字幕的话，写到转写缓存文件，NoteGenerator 的 cache-hit 逻辑会直接用上
         if data.prefetched_transcript:
@@ -246,6 +321,9 @@ def get_task_status(task_id: str):
 
         status = status_content.get("status")
         message = status_content.get("message", "")
+        pipeline = status_content.get("pipeline")
+        pipeline_label = status_content.get("pipeline_label")
+        eta_seconds = status_content.get("eta_seconds")
 
         if status == TaskStatus.SUCCESS.value:
             # 成功状态的话，继续读取最终笔记内容
@@ -267,13 +345,25 @@ def get_task_status(task_id: str):
                 })
 
         if status == TaskStatus.FAILED.value:
-            return R.error(message or "任务失败", code=500)
+            # 用 success 包装 FAILED，避免前端把业务失败当成 HTTP/业务 code 异常
+            # 从而丢掉真实 message（例如阿里云 data_inspection_failed）
+            return R.success({
+                "status": status,
+                "message": message or "任务失败",
+                "task_id": task_id,
+                "pipeline": pipeline,
+                "pipeline_label": pipeline_label,
+                "eta_seconds": eta_seconds,
+            })
 
         # 处理中状态
         return R.success({
             "status": status,
             "message": message,
-            "task_id": task_id
+            "task_id": task_id,
+            "pipeline": pipeline,
+            "pipeline_label": pipeline_label,
+            "eta_seconds": eta_seconds,
         })
 
     # 没有状态文件，但有结果

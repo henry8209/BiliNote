@@ -15,6 +15,7 @@ import {
 } from '@/components/ui/tooltip.tsx'
 import LazyImage from "@/components/LazyImage.tsx";
 import {FC, useState, useEffect, useMemo} from 'react'
+import { resolveMediaUrl } from '@/utils/mediaUrl.ts'
 
 interface NoteHistoryProps {
   onSelect: (taskId: string) => void
@@ -91,9 +92,7 @@ const NoteHistory: FC<NoteHistoryProps> = ({ onSelect, selectedId }) => {
               {/* 封面图 */}
               {task.platform === 'local' ? (
                 <img
-                  src={
-                    task.audioMeta.cover_url ? `${task.audioMeta.cover_url}` : '/placeholder.png'
-                  }
+                  src={resolveMediaUrl(task.audioMeta.cover_url)}
                   alt="封面"
                   className="h-10 w-12 rounded-md object-cover"
                 />
@@ -134,8 +133,14 @@ const NoteHistory: FC<NoteHistoryProps> = ({ onSelect, selectedId }) => {
                   </div>
                 )}
                 {task.status !== 'SUCCESS' && task.status !== 'FAILED' ? (
-                  <div className={'w-10 rounded bg-green-500 p-0.5 text-center text-white'}>
-                    等待中
+                  <div className={'rounded bg-green-500 p-0.5 px-1 text-center text-white'}>
+                    {task.pipeline === 'youtube_subtitles'
+                      ? '方案A 字幕'
+                      : task.pipeline === 'mlx_whisper_api'
+                        ? '方案B MLX'
+                        : task.pipeline === 'whisper_cpu'
+                          ? '方案C Whisper'
+                          : '處理中'}
                   </div>
                 ) : (
                   <></>

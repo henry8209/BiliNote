@@ -19,6 +19,7 @@ import 'katex/dist/katex.min.css'
 import 'github-markdown-css/github-markdown-light.css'
 import { ScrollArea } from '@/components/ui/scroll-area.tsx'
 import { useTaskStore } from '@/store/taskStore'
+import { useModelStore } from '@/store/modelStore'
 import { noteStyles } from '@/constant/note.ts'
 import { MarkdownHeader } from '@/pages/HomePage/components/MarkdownHeader.tsx'
 import TranscriptViewer from '@/pages/HomePage/components/transcriptViewer.tsx'
@@ -326,7 +327,36 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
   const currentTask = useTaskStore(state => state.getCurrentTask())
   const taskStatus = currentTask?.status || 'PENDING'
   const retryTask = useTaskStore.getState().retryTask
+  const loadEnabledModels = useModelStore(state => state.loadEnabledModels)
   const isMultiVersion = Array.isArray(currentTask?.markdown)
+
+  const handleRetry = async () => {
+    if (!currentTask?.id) return
+    // 失败页「重试」以前直接复用旧 formData；若当时 provider_id 解析错了会一直错。
+    // 这里按 model_name(+provider_id) 重新从启用列表解析供应商。
+    try {
+      await loadEnabledModels()
+    } catch {
+      /* ignore */
+    }
+    const list = useModelStore.getState().modelList
+    const fd = currentTask.formData || ({} as any)
+    const matched =
+      list.find(
+        m =>
+          m.model_name === fd.model_name &&
+          (!fd.provider_id || String(m.provider_id) === String(fd.provider_id)),
+      ) || list.find(m => m.model_name === fd.model_name)
+    if (!matched) {
+      toast.error('找不到對應模型，請在表單重新選擇模型後再提交')
+      return
+    }
+    retryTask(currentTask.id, {
+      ...fd,
+      model_name: matched.model_name,
+      provider_id: String(matched.provider_id),
+    })
+  }
   const [showTranscribe, setShowTranscribe] = useState(false)
   const [showChat, setShowChat] = useState<false | 'half' | 'full'>(false)
   const [viewMode, setViewMode] = useState<'map' | 'preview'>('preview')
@@ -416,13 +446,49 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
   }
 
   if (status === 'loading') {
+    const liveMsg = currentTask?.statusMessage || ''
+    const pipeline = currentTask?.pipeline || ''
+    const pipelineLabel = currentTask?.pipelineLabel || ''
+    const etaSeconds = currentTask?.etaSeconds
+    const etaMin = etaSeconds ? Math.max(1, Math.round(etaSeconds / 60)) : null
+    const isSlow = pipeline === 'whisper_cpu'
+    const isFast = pipeline === 'youtube_subtitles'
+    const isMlx = pipeline === 'mlx_whisper_api'
     return (
       <div className="flex h-screen w-full flex-col items-center justify-center space-y-4 text-neutral-500">
         <StepBar steps={steps} currentStep={taskStatus} />
         <Loading className="h-5 w-5" />
-        <div className="text-center text-sm">
-          <p className="text-lg font-bold">正在生成笔记，请稍候…</p>
-          <p className="mt-2 text-xs text-neutral-500">这可能需要几秒钟时间，取决于视频长度</p>
+        <div className="text-center text-sm max-w-md px-4">
+          <p className="text-lg font-bold">
+            {isFast
+              ? '方案 A｜平台字幕（快通道）'
+              : isMlx
+                ? '方案 B｜內網 MLX Whisper（無字幕，不出公網）'
+                : isSlow
+                  ? '方案 C｜本機 Whisper CPU（fallback）'
+                  : '正在選擇處理方案…'}
+          </p>
+          <div
+            className={`mt-3 rounded-md border px-3 py-2 text-left text-xs ${
+              isSlow
+                ? 'border-amber-300 bg-amber-50 text-amber-900'
+                : isMlx || isFast
+                  ? 'border-emerald-300 bg-emerald-50 text-emerald-900'
+                  : 'border-neutral-200 bg-neutral-50 text-neutral-700'
+            }`}
+            role="status"
+          >
+            <div className="font-semibold">
+              Pipeline：{pipelineLabel || pipeline || '準備中'}
+              {etaMin ? `  ·  預估約 ${etaMin} 分鐘` : ''}
+            </div>
+            <div className="mt-1 whitespace-pre-wrap">
+              {liveMsg ||
+                (isSlow
+                  ? '無字幕，本機 Whisper medium（CPU，最多 2 核）。唔會係 60 秒完成。'
+                  : '有字幕時約 1–2 分鐘；無字幕會改走 Whisper 慢通道。')}
+            </div>
+          </div>
         </div>
       </div>
     )
@@ -441,15 +507,35 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
   }
 
   if (status === 'failed' && !isMultiVersion) {
+    const rawMsg = currentTask?.errorMessage || ''
+    const isInspection =
+      rawMsg.includes('data_inspection_failed') ||
+      rawMsg.includes('inappropriate content')
+    const title = isInspection ? '模型內容審核失敗' : '筆記生成失敗'
+    const friendly = isInspection
+      ? '供應商內容安全審查拒絕了此影片的輸入文字（阿里雲百煉對政治／敏感新聞很常見）。請改用 Agnes 等其他模型後再生成；用同一阿里雲模型重試通常仍會失敗。'
+      : rawMsg
+        ? rawMsg.slice(0, 280)
+        : '請檢查模型／網路後再試。'
     return (
       <div className="flex h-screen w-full flex-col items-center justify-center gap-4 space-y-3">
         <Error />
-        <div className="text-center">
-          <p className="text-lg font-bold text-red-500">笔记生成失败</p>
-          <p className="mt-2 mb-2 text-xs text-red-400">请检查后台或稍后再试</p>
+        <div className="text-center max-w-lg px-4">
+          <p className="text-lg font-bold text-red-500">{title}</p>
+          <div
+            className={`mt-3 mb-3 rounded-md border px-3 py-2 text-left text-xs whitespace-pre-wrap break-words ${
+              isInspection
+                ? 'border-amber-300 bg-amber-50 text-amber-900'
+                : 'border-red-200 bg-red-50 text-red-700'
+            }`}
+            role="alert"
+          >
+            {isInspection && <div className="mb-1 font-semibold">⚠️ Content inspection failed</div>}
+            {friendly}
+          </div>
 
-          <Button onClick={() => retryTask(currentTask.id)} size="lg">
-            重试
+          <Button onClick={handleRetry} size="lg">
+            重試
           </Button>
         </div>
       </div>

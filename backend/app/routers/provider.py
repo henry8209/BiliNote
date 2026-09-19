@@ -91,6 +91,18 @@ def update_provider(data: ProviderUpdateRequest):
         print(e)
         return R.error(msg=str(e))
 
+
+@router.post("/delete_provider/{id}")
+def delete_provider(id: str):
+    try:
+        ProviderService.delete_provider(id)
+        return R.success(msg="删除模型供应商成功")
+    except ValueError as e:
+        return R.error(msg=str(e))
+    except Exception as e:
+        return R.error(msg=str(e))
+
+
 @router.post('/connect_test')
 def gpt_connect_test(data: TestRequest):
     ModelService().connect_test(data.id, model=data.model)

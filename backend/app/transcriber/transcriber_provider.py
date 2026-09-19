@@ -55,7 +55,17 @@ def get_groq_transcriber():
     return _init_transcriber(TranscriberType.GROQ, GroqTranscriber)
 
 def get_whisper_transcriber(model_size="base", device="cuda"):
-    return _init_transcriber(TranscriberType.FAST_WHISPER, WhisperTranscriber, model_size=model_size, device=device)
+    try:
+        cpu_threads = int(os.getenv("WHISPER_CPU_THREADS", "3"))
+    except ValueError:
+        cpu_threads = 3
+    return _init_transcriber(
+        TranscriberType.FAST_WHISPER,
+        WhisperTranscriber,
+        model_size=model_size,
+        device=device,
+        cpu_threads=cpu_threads,
+    )
 
 def get_bcut_transcriber():
     return _init_transcriber(TranscriberType.BCUT, BcutTranscriber)

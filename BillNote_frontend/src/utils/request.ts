@@ -46,17 +46,31 @@ request.interceptors.response.use(
   (error) => {
     const suppress = error?.config?.suppressToast === true
     // 网络/服务器错误
+    const status = error?.response?.status
     const res = error?.response?.data as IResponse | undefined;
-    if (res) {
+    if (status === 502 || status === 503) {
+      if (!suppress) toast.error('後端暫時無法連線，請稍候再試（不是影片連結問題）')
+      return Promise.reject(res || { code: status, msg: 'backend unavailable', data: null })
+    }
+    if (res && typeof res === 'object' && 'msg' in res) {
       // 如果后端有返回错误信息，则显示后端信息
       if (!suppress) toast.error(res.msg || '服务器错误，请稍后再试');
       return Promise.reject(res);
     } else {
-      // 没有响应数据（如网络中断），显示通用网络错误
-      if (!suppress) toast.error('请求失败，请检查网络连接或稍后再试')
+      // 没有响应数据（如网络中断 / 超时）
+      const isTimeout =
+        error?.code === 'ECONNABORTED' ||
+        String(error?.message || '').toLowerCase().includes('timeout')
+      if (!suppress) {
+        toast.error(
+          isTimeout
+            ? '上傳或請求超時（大影片請等傳完，已放寬時限）。請再試一次。'
+            : '请求失败，请检查网络连接或稍后再试',
+        )
+      }
       return Promise.reject({
         code: -1,
-        msg: '请求失败，请检查网络连接',
+        msg: isTimeout ? 'timeout' : '请求失败，请检查网络连接',
         data: null
       } as IResponse);
     }

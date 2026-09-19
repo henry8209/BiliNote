@@ -7,3 +7,9 @@ def init_db():
     engine = get_engine()
 
     Base.metadata.create_all(bind=engine)
+    # Older DBs may lack models.config — best-effort migrate
+    try:
+        from app.db.model_dao import ensure_models_config_column
+        ensure_models_config_column()
+    except Exception:
+        pass

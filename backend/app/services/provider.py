@@ -148,4 +148,13 @@ class ProviderService:
 
     @staticmethod
     def delete_provider(id: str):
-        return delete_provider(id)
+        row = get_provider_by_id(id)
+        if not row:
+            raise ValueError("供应商不存在")
+        # 内置供应商不允许删除，避免误删系统默认项
+        if getattr(row, "type", None) == "built-in":
+            raise ValueError("内置供应商不可删除")
+        ok = delete_provider(id)
+        if not ok:
+            raise RuntimeError("删除供应商失败")
+        return True

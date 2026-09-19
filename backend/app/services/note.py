@@ -1,9 +1,21 @@
 import json
 import logging
 import os
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple, Union, Any
+
+
+def _to_jsonable(obj):
+    """安全序列化：仅对 dataclass 用 asdict；None/dict 友好处理。"""
+    if obj is None:
+        raise TypeError("expected dataclass instance, got None")
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return asdict(obj)
+    if isinstance(obj, dict):
+        return obj
+    raise TypeError(f"asdict() should be called on dataclass instances, got {type(obj).__name__}")
+
 
 from fastapi import HTTPException
 from pydantic import HttpUrl
@@ -15,6 +27,8 @@ from app.downloaders.douyin_downloader import DouyinDownloader
 from app.downloaders.local_downloader import LocalDownloader
 from app.downloaders.youtube_downloader import YoutubeDownloader
 from app.db.video_task_dao import delete_task_by_video, insert_video_task
+from app.db.model_dao import get_model_by_provider_and_name
+from app.gpt.thinking_profiles import normalize_thinking
 from app.enmus.exception import NoteErrorEnum, ProviderErrorEnum
 from app.enmus.task_status_enums import TaskStatus
 from app.enmus.note_enums import DownloadQuality
@@ -121,8 +135,16 @@ class NoteGenerator:
             grid_size = []
 
         try:
-            logger.info(f"开始生成笔记 (task_id={task_id})")
-            self._update_status(task_id, TaskStatus.PARSING)
+            logger.info(
+                f"开始生成笔记 (task_id={task_id}) model_name={model_name} provider_id={provider_id}"
+            )
+            self._update_status(
+                task_id,
+                TaskStatus.PARSING,
+                message="正在解析連結…",
+                model_name=model_name,
+                provider_id=provider_id,
+            )
 
             # 获取下载器与 GPT 实例
 
@@ -159,8 +181,16 @@ class NoteGenerator:
                     if transcript and transcript.segments:
                         logger.info(f"成功获取平台字幕，共 {len(transcript.segments)} 段")
                         transcript_cache_file.write_text(
-                            json.dumps(asdict(transcript), ensure_ascii=False, indent=2),
+                            json.dumps(_to_jsonable(transcript), ensure_ascii=False, indent=2),
                             encoding="utf-8",
+                        )
+                        self._update_status(
+                            task_id,
+                            TaskStatus.TRANSCRIBING,
+                            message="已取得平台字幕，跳過 Whisper。接著用 LLM 寫筆記，大約 1–2 分鐘。",
+                            pipeline="youtube_subtitles",
+                            pipeline_label="平台字幕（快通道）",
+                            eta_seconds=90,
                         )
                     else:
                         transcript = None
@@ -173,6 +203,11 @@ class NoteGenerator:
             # 有字幕时只提取元信息，不下载音视频文件（除非需要截图/视频理解）
             has_transcript = transcript is not None
             need_full_download = not has_transcript or screenshot or video_understanding
+            self._update_status(
+                task_id,
+                TaskStatus.DOWNLOADING,
+                message="正在下載音訊／影片…",
+            )
             audio_meta = self._download_media(
                 downloader=downloader,
                 video_url=video_url,
@@ -232,12 +267,85 @@ class NoteGenerator:
             # 6. 完成
             self._update_status(task_id, TaskStatus.SUCCESS)
             logger.info(f"笔记生成成功 (task_id={task_id})")
+            try:
+                self._cleanup_source_media(platform, video_url, audio_meta)
+            except Exception as clean_exc:
+                logger.warning(f"清理源媒体失败: {clean_exc}")
             return NoteResult(markdown=markdown, transcript=transcript, audio_meta=audio_meta)
 
         except Exception as exc:
             logger.error(f"生成笔记流程异常 (task_id={task_id})：{exc}", exc_info=True)
             self._update_status(task_id, TaskStatus.FAILED, message=str(exc))
+            try:
+                self._cleanup_source_media(
+                    platform, video_url, audio_meta if "audio_meta" in locals() else None
+                )
+            except Exception:
+                pass
             return None
+
+    def _cleanup_source_media(self, platform: str, video_url: str, audio_meta=None) -> None:
+        """笔记完成后删除源视频/音频。保留 note_results 与 static/cover、screenshots。"""
+        from app.utils.path_helper import get_data_dir
+
+        cwd = os.getcwd()
+        uploads_root = os.path.normpath(os.path.join(cwd, "uploads"))
+        data_root = os.path.normpath(get_data_dir())
+        allowed_roots = (uploads_root, data_root)
+
+        candidates: list[str] = []
+        url = str(video_url or "")
+        if url.startswith("/uploads"):
+            candidates.append(os.path.normpath(os.path.join(cwd, url.lstrip("/"))))
+        fp = getattr(audio_meta, "file_path", None) if audio_meta is not None else None
+        if fp:
+            candidates.append(str(fp))
+        if getattr(self, "video_path", None):
+            candidates.append(str(self.video_path))
+        vid = getattr(audio_meta, "video_id", None) if audio_meta is not None else None
+        if vid:
+            try:
+                for name in os.listdir(data_root):
+                    if name.startswith(str(vid)):
+                        candidates.append(os.path.join(data_root, name))
+            except OSError:
+                pass
+
+        media_ext = {
+            ".mp3",
+            ".mp4",
+            ".m4a",
+            ".wav",
+            ".webm",
+            ".mkv",
+            ".aac",
+            ".part",
+            ".ytdl",
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp",
+        }
+        to_delete: set[str] = set()
+        for p in candidates:
+            if not p:
+                continue
+            np = os.path.normpath(p)
+            if not any(np.startswith(root + os.sep) or np == root for root in allowed_roots):
+                continue
+            to_delete.add(np)
+            stem, _ = os.path.splitext(np)
+            for ext in media_ext:
+                to_delete.add(stem + ext)
+            to_delete.add(stem + "_cover.jpg")
+
+        for path in to_delete:
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+                    logger.info(f"已删除源媒体: {path}")
+            except OSError as e:
+                logger.warning(f"删除失败 {path}: {e}")
 
     @staticmethod
     def delete_note(video_id: str, platform: str) -> int:
@@ -276,12 +384,22 @@ class NoteGenerator:
             logger.error(f"[get_gpt] 未找到模型供应商: provider_id={provider_id}")
             raise ProviderError(code=ProviderErrorEnum.NOT_FOUND,message=ProviderErrorEnum.NOT_FOUND.message)
         logger.info(f"创建 GPT 实例 {provider_id}")
+        model_data = get_model_by_provider_and_name(provider_id, model_name)
+        thinking = normalize_thinking(
+            (model_data or {}).get("config"),
+            model_name=model_name or "",
+        )
+        logger.info(
+            f"[get_gpt] model={model_name} thinking.mode={thinking.get('mode')} "
+            f"capability={thinking.get('capability')} strategy={thinking.get('strategy')}"
+        )
         config = ModelConfig(
             api_key=provider["api_key"],
             base_url=provider["base_url"],
             model_name=model_name,
             provider=provider["type"],
             name=provider["name"],
+            thinking=thinking,
         )
         return GPTFactory().from_config(config)
 
@@ -308,13 +426,20 @@ class NoteGenerator:
         logger.info(f"使用下载器：{downloader_cls.__class__}")
         return instance
 
-    def _update_status(self, task_id: Optional[str], status: Union[str, TaskStatus], message: Optional[str] = None):
+    def _update_status(
+        self,
+        task_id: Optional[str],
+        status: Union[str, TaskStatus],
+        message: Optional[str] = None,
+        **extra,
+    ):
         """
         创建或更新 {task_id}.status.json，记录当前任务状态
 
         :param task_id: 任务唯一 ID
         :param status: TaskStatus 枚举或自定义状态字符串
         :param message: 可选消息，用于记录失败原因等
+        :param extra: 额外字段（如 model_name / provider_id），会合并进状态文件
         """
         if not task_id:
             return
@@ -322,9 +447,29 @@ class NoteGenerator:
         NOTE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         status_file = NOTE_OUTPUT_DIR / f"{task_id}.status.json"
         print(f"写入状态文件: {status_file} 当前状态: {status}")
-        data = {"status": status.value if isinstance(status, TaskStatus) else status}
+        # 保留已有字段（例如首次写入的 model_name），避免后续状态覆盖掉排查信息
+        data = {}
+        if status_file.exists():
+            try:
+                data = json.loads(status_file.read_text(encoding="utf-8")) or {}
+            except Exception:
+                data = {}
+        data["status"] = status.value if isinstance(status, TaskStatus) else status
         if message:
             data["message"] = message
+        locked = {"youtube_subtitles", "mlx_whisper_api", "whisper_cpu"}
+        current_pipe = data.get("pipeline")
+        for k, v in (extra or {}).items():
+            if v is None:
+                continue
+            if (
+                k in ("pipeline", "pipeline_label", "eta_seconds")
+                and current_pipe in locked
+                and extra.get("pipeline") not in locked
+            ):
+                # 已确定 A/B/C 转写方案后，后续下载/保存不要覆盖标签
+                continue
+            data[k] = v
 
         try:
             # First create a temporary file
@@ -414,7 +559,7 @@ class NoteGenerator:
                     skip_download=True,
                 )
                 audio_cache_file.write_text(
-                    json.dumps(asdict(audio), ensure_ascii=False, indent=2),
+                    json.dumps(_to_jsonable(audio), ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
                 logger.info(f"元信息提取完成 ({audio_cache_file})")
@@ -460,7 +605,7 @@ class NoteGenerator:
                 output_dir=output_path,
                 need_video=need_video,
             )
-            audio_cache_file.write_text(json.dumps(asdict(audio), ensure_ascii=False, indent=2), encoding="utf-8")
+            audio_cache_file.write_text(json.dumps(_to_jsonable(audio), ensure_ascii=False, indent=2), encoding="utf-8")
             logger.info(f"音频下载并缓存成功 ({audio_cache_file})")
             return audio
         except Exception as exc:
@@ -489,8 +634,6 @@ class NoteGenerator:
         :param task_id: 任务 ID
         :return: TranscriptResult 对象
         """
-        self._update_status(task_id, status_phase)
-
         # 已有缓存，直接返回
         if transcript_cache_file.exists():
             logger.info(f"检测到转写缓存 ({transcript_cache_file})，尝试读取")
@@ -509,7 +652,7 @@ class NoteGenerator:
                 logger.info(f"成功获取平台字幕，共 {len(transcript.segments)} 段")
                 # 缓存结果
                 transcript_cache_file.write_text(
-                    json.dumps(asdict(transcript), ensure_ascii=False, indent=2),
+                    json.dumps(_to_jsonable(transcript), ensure_ascii=False, indent=2),
                     encoding="utf-8"
                 )
                 return transcript
@@ -541,7 +684,32 @@ class NoteGenerator:
         :return: TranscriptResult 对象
         """
         task_id = transcript_cache_file.stem.split("_")[0]
-        self._update_status(task_id, status_phase)
+        duration_sec = 0
+        try:
+            audio_json = transcript_cache_file.with_name(f"{task_id}_audio.json")
+            if audio_json.exists():
+                meta = json.loads(audio_json.read_text(encoding="utf-8"))
+                duration_sec = int(meta.get("duration") or 0)
+        except Exception:
+            duration_sec = 0
+        dur_min = max(1, duration_sec // 60) if duration_sec else None
+        # 实测 MLX large-v3-turbo ≈ 16× 实时（18.6 分钟片 ~69 秒）
+        mlx_eta = max(45, int(duration_sec / 12) + 20) if duration_sec else 90
+        mlx_msg = (
+            "Pipeline：內網 MLX Whisper API（無字幕優先通道）。"
+            + (f" 影片約 {dur_min} 分鐘，" if dur_min else " ")
+            + f"預估轉寫約 {max(1, mlx_eta // 60)} 分鐘（失敗會自動改用本機 3 核 Whisper）。"
+        )
+        self._update_status(
+            task_id,
+            status_phase,
+            message=mlx_msg,
+            pipeline="mlx_whisper_api",
+            pipeline_label="內網 MLX Whisper（無字幕快通道）",
+            eta_seconds=mlx_eta,
+            video_duration_seconds=duration_sec or None,
+        )
+        logger.info(mlx_msg)
 
         # 已有缓存，尝试加载
         if transcript_cache_file.exists():
@@ -553,17 +721,88 @@ class NoteGenerator:
             except Exception as e:
                 logger.warning(f"加载转写缓存失败，将重新转写：{e}")
 
-        # 调用转写器
+        # 调用转写器：优先内网 MLX API，失败再 fallback 本机 Whisper
         try:
             logger.info("开始转写音频")
-            transcript = self.transcriber.transcript(file_path=audio_file)
-            transcript_cache_file.write_text(json.dumps(asdict(transcript), ensure_ascii=False, indent=2), encoding="utf-8")
+            transcript = self._transcript_with_fallback(
+                audio_file=audio_file,
+                task_id=task_id,
+                status_phase=status_phase,
+                duration_sec=duration_sec,
+            )
+            if transcript is None:
+                raise RuntimeError(
+                    f"转写器返回空结果（音频可能损坏或不可读）: {audio_file}"
+                )
+            transcript_cache_file.write_text(
+                json.dumps(_to_jsonable(transcript), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
             logger.info(f"转写并缓存成功 ({transcript_cache_file})")
             return transcript
         except Exception as exc:
             logger.error(f"音频转写失败：{exc}")
+            # 坏音频缓存会导致反复失败：删除以便下次重新下载
+            try:
+                if audio_file and Path(audio_file).exists():
+                    msg = str(exc).lower()
+                    if (
+                        "invalid data" in msg
+                        or "moov" in msg
+                        or "could not open" in msg
+                        or "empty" in msg
+                    ):
+                        Path(audio_file).unlink(missing_ok=True)
+                        logger.warning(f"已删除可能损坏的音频缓存: {audio_file}")
+            except Exception:
+                pass
             self._handle_exception(task_id, exc)
             raise
+
+    def _transcript_with_fallback(
+        self,
+        audio_file: str,
+        task_id: str,
+        status_phase: TaskStatus,
+        duration_sec: int,
+    ) -> TranscriptResult | None:
+        """无字幕：先打内网 MLX API（不出公网），失败再 fallback 本机 3 核 Whisper。"""
+        from app.transcriber.mlx_api_transcriber import MlxApiTranscriber
+
+        mlx = MlxApiTranscriber()
+        if mlx.available():
+            try:
+                result = mlx.transcript(audio_file)
+                logger.info("MLX API 转写成功，跳过本机 Whisper")
+                return result
+            except Exception as exc:
+                logger.warning(f"MLX API 转写失败，fallback 本机 Whisper: {exc}")
+        else:
+            logger.info("未配置 MLX_WHISPER_API_URL，直接本机 Whisper")
+
+        try:
+            threads = int(os.getenv("WHISPER_CPU_THREADS", "3"))
+        except ValueError:
+            threads = 3
+        factor = 1.7 if threads <= 2 else (1.45 if threads == 3 else 1.35)
+        eta = max(180, int(duration_sec * factor)) if duration_sec else 900
+        dur_min = max(1, duration_sec // 60) if duration_sec else None
+        whisper_msg = (
+            "內網 MLX 不可用，已 fallback。"
+            f" Pipeline：本機 Whisper medium（CPU，{threads} 核）。"
+            + (f" 影片約 {dur_min} 分鐘，" if dur_min else " ")
+            + f"預估轉寫 {max(1, eta // 60)} 分鐘。"
+        )
+        self._update_status(
+            task_id,
+            status_phase,
+            message=whisper_msg,
+            pipeline="whisper_cpu",
+            pipeline_label="本機 Whisper CPU（fallback）",
+            eta_seconds=eta,
+            video_duration_seconds=duration_sec or None,
+        )
+        return self.transcriber.transcript(file_path=audio_file)
 
     def _summarize_text(
         self,
@@ -593,7 +832,11 @@ class NoteGenerator:
         :return: 生成的 Markdown 字符串
         """
         task_id = markdown_cache_file.stem
-        self._update_status(task_id, TaskStatus.SUMMARIZING)
+        self._update_status(
+            task_id,
+            TaskStatus.SUMMARIZING,
+            message="轉寫／字幕已完成，正在用 LLM 寫筆記…",
+        )
 
         source = GPTSource(
             title=audio_meta.title,

@@ -1,11 +1,24 @@
 
 
-from app.db.model_dao import insert_model, get_all_models, get_model_by_provider_and_name, delete_model
+from app.db.model_dao import (
+    insert_model,
+    get_all_models,
+    get_model_by_provider_and_name,
+    delete_model,
+    update_model_config,
+    get_model_by_id,
+    ensure_models_config_column,
+)
 from app.db.provider_dao import get_enabled_providers
 from app.enmus.exception import ProviderErrorEnum
 from app.exceptions.provider import ProviderError
 from app.gpt.gpt_factory import GPTFactory
 from app.gpt.provider.OpenAI_compatible_provider import OpenAICompatibleProvider
+from app.gpt.thinking_profiles import (
+    normalize_thinking,
+    suggest_thinking_profile,
+    wrap_model_config,
+)
 from app.models.model_config import ModelConfig
 from app.services.provider import ProviderService
 from app.utils.logger import get_logger
@@ -67,20 +80,27 @@ class ModelService:
         """
         formatted = []
         for model in raw_models:
+            cfg = model.get("config") or {}
+            thinking = normalize_thinking(cfg, model_name=model.get("model_name") or "")
+            created = model.get("created_at", None)
+            if created is not None and hasattr(created, "isoformat"):
+                created = created.isoformat()
             formatted.append({
                 "id": model.get("id"),
                 "provider_id": model.get("provider_id"),
                 "model_name": model.get("model_name"),
-                "created_at": model.get("created_at", None),  # 如果有created_at字段
+                "created_at": created,
+                "config": wrap_model_config(thinking, cfg),
+                "thinking": thinking,
             })
         return formatted
     @staticmethod
     def get_enabled_models_by_provider( provider_id: str|int,):
         from app.db.model_dao import get_models_by_provider
 
+        ensure_models_config_column()
         all_models = get_models_by_provider(provider_id)
-        enabled_models = all_models
-        return enabled_models
+        return ModelService._format_models(all_models)
     @staticmethod
     def get_all_models_by_id(provider_id: str, verbose: bool = False):
         try:
@@ -152,8 +172,9 @@ class ModelService:
             print(f"[{model_id}] <UNK>: {e}")
             return False
     @staticmethod
-    def add_new_model(provider_id: int, model_name: str) -> bool:
+    def add_new_model(provider_id: int, model_name: str, thinking: dict | None = None) -> bool:
         try:
+            ensure_models_config_column()
             # 先查供应商是否存在
             provider = ProviderService.get_provider_by_id(provider_id)
             if not provider:
@@ -166,13 +187,41 @@ class ModelService:
                 print(f"模型 {model_name} 已存在于供应商ID {provider_id} 下，跳过插入")
                 return False
 
-            # 插入模型
-            insert_model(provider_id=provider_id, model_name=model_name)
-            print(f"模型 {model_name} 已成功添加到供应商ID {provider_id}")
+            if thinking:
+                profile = normalize_thinking({"thinking": thinking}, model_name=model_name)
+                for key in ("mode", "capability", "strategy", "notes", "reasoning_effort"):
+                    if key in thinking and thinking[key] is not None:
+                        profile[key] = thinking[key]
+            else:
+                profile = suggest_thinking_profile(model_name)
+            config = wrap_model_config(profile)
+            insert_model(provider_id=provider_id, model_name=model_name, config=config)
+            print(f"模型 {model_name} 已成功添加到供应商ID {provider_id} thinking={profile}")
             return True
         except Exception as e:
             print(f"添加模型失败: {e}")
             return False
+
+    @staticmethod
+    def update_model_thinking(model_id: int, thinking: dict) -> dict | None:
+        ensure_models_config_column()
+        model = get_model_by_id(model_id)
+        if not model:
+            return None
+        profile = normalize_thinking({"thinking": thinking}, model_name=model.get("model_name") or "")
+        # allow explicit overrides from client
+        for key in ("mode", "capability", "strategy", "notes", "reasoning_effort"):
+            if key in (thinking or {}) and thinking[key] is not None:
+                profile[key] = thinking[key]
+        updated = update_model_config(model_id, wrap_model_config(profile, model.get("config")))
+        if not updated:
+            return None
+        formatted = ModelService._format_models([updated])
+        return formatted[0] if formatted else None
+
+    @staticmethod
+    def suggest_thinking(model_name: str) -> dict:
+        return suggest_thinking_profile(model_name)
 
 if __name__ == '__main__':
     # 单个 Provider 测试

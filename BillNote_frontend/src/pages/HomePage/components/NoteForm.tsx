@@ -38,8 +38,18 @@ import { Input } from '@/components/ui/input.tsx'
 import { Textarea } from '@/components/ui/textarea.tsx'
 import { noteStyles, noteFormats, videoPlatforms } from '@/constant/note.ts'
 import { fetchModels } from '@/services/model.ts'
+import { useProviderStore } from '@/store/providerStore'
 import { useNavigate } from 'react-router-dom'
 import toast from 'react-hot-toast'
+
+/** Select 的 value：provider_id::model_name，避免同名模型跨供应商歧义 */
+const modelSelectValue = (providerId: string, modelName: string) =>
+  `${providerId}::${modelName}`
+const parseModelSelectValue = (value: string) => {
+  const idx = value.indexOf('::')
+  if (idx <= 0) return { provider_id: '', model_name: value }
+  return { provider_id: value.slice(0, idx), model_name: value.slice(idx + 2) }
+}
 
 /* -------------------- 校验 Schema -------------------- */
 const formSchema = z
@@ -50,6 +60,8 @@ const formSchema = z
     screenshot: z.boolean().optional(),
     link: z.boolean().optional(),
     model_name: z.string().nonempty('请选择模型'),
+    // 与 model_name 成对提交，避免只靠 model_name 反查 provider 导致选错供应商
+    provider_id: z.string().nonempty('请选择模型供应商'),
     format: z.array(z.string()).default([]),
     style: z.string().nonempty('请选择笔记生成风格'),
     extras: z.string().optional(),
@@ -64,6 +76,12 @@ const formSchema = z
     if (platform === 'local') {
       if (!video_url) {
         ctx.addIssue({ code: 'custom', message: '本地视频路径不能为空', path: ['video_url'] })
+      } else if (/^https?:\/\//i.test(video_url)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: '已选择本地视频，请先上传文件（不要留下 YouTube/B 站链接）',
+          path: ['video_url'],
+        })
       }
     }
     else {
@@ -132,22 +150,67 @@ const NoteForm = () => {
   const navigate = useNavigate();
   const [isUploading, setIsUploading] = useState(false)
   const [uploadSuccess, setUploadSuccess] = useState(false)
+  const [uploadPercent, setUploadPercent] = useState(0)
   /* ---- 全局状态 ---- */
   const { addPendingTask, currentTaskId, setCurrentTask, getCurrentTask, retryTask } =
     useTaskStore()
   const { loadEnabledModels, modelList, showFeatureHint, setShowFeatureHint } = useModelStore()
 
+  const FORM_PREFS_KEY = 'bilinote-form-prefs'
+  const loadFormPrefs = () => {
+    try {
+      const raw = localStorage.getItem(FORM_PREFS_KEY)
+      return raw ? JSON.parse(raw) : {}
+    } catch {
+      return {}
+    }
+  }
+  const saveFormPrefs = (values: Partial<NoteFormValues>) => {
+    try {
+      const prev = loadFormPrefs()
+      const next = {
+        ...prev,
+        platform: values.platform,
+        model_name: values.model_name,
+        provider_id: values.provider_id,
+        style: values.style,
+        quality: values.quality,
+        extras: values.extras,
+        screenshot: values.screenshot,
+        link: values.link,
+        video_understanding: values.video_understanding,
+        video_interval: values.video_interval,
+        grid_size: values.grid_size,
+        format: values.format,
+      }
+      localStorage.setItem(FORM_PREFS_KEY, JSON.stringify(next))
+    } catch {
+      /* ignore quota */
+    }
+  }
+  const prefs = loadFormPrefs()
+  const fetchProviderList = useProviderStore(state => state.fetchProviderList)
+  const providers = useProviderStore(state => state.provider)
+  const providerNameById = (id?: string) =>
+    providers.find(p => String(p.id) === String(id))?.name || id || '未知供應商'
+
   /* ---- 表单 ---- */
   const form = useForm<NoteFormValues>({
     resolver: zodResolver(formSchema),
     defaultValues: {
-      platform: 'bilibili',
-      quality: 'medium',
-      model_name: modelList[0]?.model_name || '',
-      style: 'minimal',
-      video_interval: 6,
-      grid_size: [2, 2],
-      format: [],
+      platform: prefs.platform || 'bilibili',
+      quality: prefs.quality || 'medium',
+      model_name: prefs.model_name || modelList[0]?.model_name || '',
+      provider_id: prefs.provider_id || modelList[0]?.provider_id || '',
+      style: prefs.style || 'minimal',
+      extras: prefs.extras || '',
+      screenshot: prefs.screenshot ?? false,
+      link: prefs.link ?? false,
+      video_understanding: prefs.video_understanding ?? false,
+      video_interval: prefs.video_interval ?? 6,
+      grid_size: prefs.grid_size ?? [2, 2],
+      format: prefs.format ?? [],
+      video_url: '',
     },
   })
   const currentTask = getCurrentTask()
@@ -163,19 +226,52 @@ const NoteForm = () => {
   /* ---- 副作用 ---- */
   useEffect(() => {
     loadEnabledModels()
-
-    return
+    fetchProviderList().catch(() => undefined)
   }, [])
+
+  useEffect(() => {
+    const sub = form.watch((vals, info) => {
+      if (!info.name) return
+      if (['model_name', 'provider_id', 'style', 'format', 'quality', 'platform'].includes(info.name)) {
+        saveFormPrefs(vals as NoteFormValues)
+      }
+    })
+    return () => sub.unsubscribe()
+  }, [form])
+
+  // 模型列表加载完成后，若尚未选定供应商，按当前 model_name 补齐 provider_id
+  useEffect(() => {
+    if (!modelList.length) return
+    const currentName = form.getValues('model_name')
+    const currentProvider = form.getValues('provider_id')
+    if (currentName && currentProvider) return
+    const fallback =
+      modelList.find(m => m.model_name === currentName) || modelList[0]
+    if (!fallback) return
+    form.setValue('model_name', fallback.model_name)
+    form.setValue('provider_id', fallback.provider_id)
+  }, [modelList.length])
+
   useEffect(() => {
     if (!currentTask) return
     const { formData } = currentTask
 
     console.log('currentTask.formData.platform:', formData.platform)
 
+    const matched =
+      modelList.find(
+        m =>
+          m.model_name === formData.model_name &&
+          (!formData.provider_id || String(m.provider_id) === String(formData.provider_id)),
+      ) ||
+      modelList.find(m => m.model_name === formData.model_name) ||
+      modelList[0]
+
     form.reset({
       platform: formData.platform || 'bilibili',
       video_url: formData.video_url || '',
-      model_name: formData.model_name || modelList[0]?.model_name || '',
+      model_name: formData.model_name || matched?.model_name || '',
+      provider_id: formData.provider_id || matched?.provider_id || '',
       style: formData.style || 'minimal',
       quality: formData.quality || 'medium',
       extras: formData.extras || '',
@@ -203,15 +299,17 @@ const NoteForm = () => {
     formData.append('file', file)
     setIsUploading(true)
     setUploadSuccess(false)
+    setUploadPercent(0)
 
     try {
-  
-      const  data  = await uploadFile(formData)
-        cb(data.url)
-        setUploadSuccess(true)
-    } catch (err) {
+      const data = await uploadFile(formData, p => setUploadPercent(p))
+      cb(data.url)
+      setUploadSuccess(true)
+      toast.success(`上傳成功：${file.name}`)
+    } catch (err: any) {
       console.error('上传失败:', err)
-      // message.error('上传失败，请重试')
+      setUploadSuccess(false)
+      toast.error(err?.msg || '上傳失敗')
     } finally {
       setIsUploading(false)
     }
@@ -219,15 +317,50 @@ const NoteForm = () => {
 
   const onSubmit = async (values: NoteFormValues) => {
     console.log('Not even go here')
+    // 优先用表单里成对保存的 provider_id；再用 (provider_id+model_name) 精确匹配兜底
+    const matched =
+      modelList.find(
+        m =>
+          m.model_name === values.model_name &&
+          String(m.provider_id) === String(values.provider_id),
+      ) || modelList.find(m => m.model_name === values.model_name)
+    if (!matched?.provider_id) {
+      toast.error('無法解析模型供應商，請重新選擇模型')
+      return
+    }
+    if (
+      values.provider_id &&
+      matched.provider_id &&
+      String(values.provider_id) !== String(matched.provider_id)
+    ) {
+      console.warn('provider_id mismatch, using matched list entry', {
+        form: values.provider_id,
+        matched: matched.provider_id,
+        model: values.model_name,
+      })
+    }
     const payload: NoteFormValues = {
       ...values,
-      provider_id: modelList.find(m => m.model_name === values.model_name)!.provider_id,
+      model_name: matched.model_name,
+      provider_id: String(matched.provider_id),
       task_id: currentTaskId || '',
     }
-    if (currentTaskId) {
+    saveFormPrefs(payload)
+    if (payload.platform === 'local' && /^https?:\/\//i.test(payload.video_url || '')) {
+      toast.error('已選擇本地視頻，但連結仍是網站 URL。請先上傳檔案，或撳「新建筆記」再上傳。')
+      return
+    }
+    console.log('generate payload model=', payload.model_name, 'provider=', payload.provider_id)
+    const prev = currentTask?.formData
+    const switchedSource =
+      !!prev &&
+      (prev.platform !== payload.platform || prev.video_url !== payload.video_url)
+    // 换了平台/链接视为新任务，不要复用旧 YouTube task_id 去 retry
+    if (currentTaskId && !switchedSource) {
       retryTask(currentTaskId, payload)
       return
     }
+    payload.task_id = ''
 
     // message.success('已提交任务')
     try {
@@ -255,19 +388,37 @@ const NoteForm = () => {
     // message.error('请完善所有必填项后再提交')
   }
   const handleCreateNew = () => {
-    // 🔁 这里清空当前任务状态
-    // 比如调用 resetCurrentTask() 或者 navigate 到一个新页面
     setCurrentTask(null)
+    setUploadSuccess(false)
+    const p = loadFormPrefs()
+    form.reset({
+      platform: p.platform || form.getValues('platform') || 'bilibili',
+      video_url: '',
+      quality: p.quality || form.getValues('quality') || 'medium',
+      model_name: p.model_name || form.getValues('model_name'),
+      provider_id: p.provider_id || form.getValues('provider_id'),
+      style: p.style || form.getValues('style') || 'minimal',
+      extras: p.extras || '',
+      screenshot: p.screenshot ?? false,
+      link: p.link ?? false,
+      video_understanding: p.video_understanding ?? false,
+      video_interval: p.video_interval ?? 6,
+      grid_size: p.grid_size ?? [2, 2],
+      format: p.format ?? form.getValues('format') ?? [],
+    })
   }
   const FormButton = () => {
     const label = generating ? '正在生成…' : editing ? '重新生成' : '生成笔记'
+    const localReady =
+      platform !== 'local' ||
+      (!!form.watch('video_url') && !/^https?:\/\//i.test(form.watch('video_url') || ''))
 
     return (
       <div className="flex gap-2">
         <Button
           type="submit"
           className={!editing ? 'w-full' : 'w-2/3' + ' bg-primary'}
-          disabled={generating}
+          disabled={generating || !localReady}
         >
           {generating && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
           {label}
@@ -304,7 +455,16 @@ const NoteForm = () => {
                   <Select
                     disabled={!!editing}
                     value={field.value}
-                    onValueChange={field.onChange}
+                    onValueChange={v => {
+                      field.onChange(v)
+                      if (v === 'local') {
+                        const url = form.getValues('video_url') || ''
+                        if (/^https?:\/\//i.test(url)) {
+                          form.setValue('video_url', '')
+                          setUploadSuccess(false)
+                        }
+                      }
+                    }}
                     defaultValue={field.value}
                   >
                     <FormControl>
@@ -376,7 +536,9 @@ const NoteForm = () => {
                       }}
                     >
                       {isUploading ? (
-                        <p className="text-center text-sm text-blue-500">上传中，请稍候…</p>
+                        <p className="text-center text-sm text-blue-500">
+                          上傳中 {uploadPercent}% ，請稍候…
+                        </p>
                       ) : uploadSuccess ? (
                         <p className="text-center text-sm text-green-500">上传成功！</p>
                       ) : (
@@ -400,33 +562,60 @@ const NoteForm = () => {
                className="w-full"
                control={form.control}
                name="model_name"
-               render={({ field }) => (
+               render={({ field }) => {
+                 const providerId = form.watch('provider_id')
+                 const selectValue =
+                   field.value && providerId
+                     ? modelSelectValue(String(providerId), field.value)
+                     : field.value
+                       ? modelSelectValue(
+                           String(
+                             modelList.find(m => m.model_name === field.value)?.provider_id ||
+                               '',
+                           ),
+                           field.value,
+                         )
+                       : ''
+                 return (
                  <FormItem>
-                   <SectionHeader title="模型选择" tip="不同模型效果不同，建议自行测试" />
+                   <SectionHeader title="模型选择" tip="會顯示供應商名稱，避免選錯通道" />
                    <Select
-                     onOpenChange={()=>{
-                       loadEnabledModels()
+                     onOpenChange={(open)=>{
+                       if (open) {
+                         loadEnabledModels()
+                         fetchProviderList().catch(() => undefined)
+                       }
                      }}
-                     value={field.value}
-                     onValueChange={field.onChange}
-                     defaultValue={field.value}
+                     value={selectValue}
+                     onValueChange={v => {
+                       const parsed = parseModelSelectValue(v)
+                       field.onChange(parsed.model_name)
+                       form.setValue('provider_id', parsed.provider_id, {
+                         shouldValidate: true,
+                         shouldDirty: true,
+                       })
+                     }}
                    >
                      <FormControl>
                        <SelectTrigger className="w-full min-w-0 truncate">
-                         <SelectValue />
+                         <SelectValue placeholder="请选择模型" />
                        </SelectTrigger>
                      </FormControl>
                      <SelectContent>
                        {modelList.map(m => (
-                         <SelectItem key={m.id} value={m.model_name}>
-                           {m.model_name}
+                         <SelectItem
+                           key={`${m.provider_id}-${m.id}`}
+                           value={modelSelectValue(String(m.provider_id), m.model_name)}
+                         >
+                           {providerNameById(String(m.provider_id))} / {m.model_name}
                          </SelectItem>
                        ))}
                      </SelectContent>
                    </Select>
                    <FormMessage />
                  </FormItem>
-               )}
+                 )
+               }}
              />): (
                <FormItem>
                  <SectionHeader title="模型选择" tip="不同模型效果不同，建议自行测试" />
