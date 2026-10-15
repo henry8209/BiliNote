@@ -9,6 +9,7 @@ from app.models.audio_model import AudioDownloadResult
 import os
 import subprocess
 
+from app.transcriber.mlx_budget import probe_media_duration_seconds
 from app.utils.video_helper import save_cover_to_static
 
 
@@ -126,7 +127,7 @@ class LocalDownloader(Downloader, ABC):
         return AudioDownloadResult(
             file_path=file_path,
             title=title,
-            duration=0,  # 可选：后续加上读取时长
+            duration=probe_media_duration_seconds(file_path),
             cover_url=cover_url,  # 暂无封面
             platform="local",
             video_id=title,

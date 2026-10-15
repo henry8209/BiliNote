@@ -10,6 +10,7 @@ import requests
 
 from app.models.transcriber_model import TranscriptResult, TranscriptSegment
 from app.transcriber.base import Transcriber
+from app.transcriber.mlx_budget import MlxTimedOut, MlxUnreachable
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -41,19 +42,32 @@ class MlxApiTranscriber(Transcriber):
         if not path.exists():
             raise FileNotFoundError(file_path)
 
-        logger.info(f"MLX API 转写: {self.endpoint} file={path.name} timeout={self.timeout}s")
-        with path.open("rb") as f:
-            files = {"file": (path.name, f, "application/octet-stream")}
-            data = {
-                "model": self.model,
-                "response_format": "verbose_json",
-            }
-            resp = requests.post(
-                self.endpoint,
-                files=files,
-                data=data,
-                timeout=self.timeout,
-            )
+        read_timeout = self.timeout
+        logger.info(
+            f"MLX API 转写: {self.endpoint} file={path.name} "
+            f"connect_timeout=10s read_timeout={read_timeout:.0f}s"
+        )
+        try:
+            with path.open("rb") as f:
+                files = {"file": (path.name, f, "application/octet-stream")}
+                data = {
+                    "model": self.model,
+                    "response_format": "verbose_json",
+                }
+                resp = requests.post(
+                    self.endpoint,
+                    files=files,
+                    data=data,
+                    timeout=(10, read_timeout),
+                )
+        except requests.exceptions.ReadTimeout as exc:
+            raise MlxTimedOut(f"MLX 轉寫超過等待上限 {read_timeout:.0f} 秒") from exc
+        except requests.exceptions.ConnectTimeout as exc:
+            raise MlxUnreachable(f"連線 MLX 逾時: {exc}") from exc
+        except requests.exceptions.ConnectionError as exc:
+            raise MlxUnreachable(f"連不上 MLX: {exc}") from exc
+        except requests.exceptions.Timeout as exc:
+            raise MlxTimedOut(f"MLX 轉寫逾時 {read_timeout:.0f} 秒") from exc
         if resp.status_code >= 400:
             raise RuntimeError(f"MLX API HTTP {resp.status_code}: {resp.text[:300]}")
 
