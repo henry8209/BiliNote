@@ -21,22 +21,20 @@ class MlxUnreachable(ConnectionError):
     """Connect failed. This transcription never started on MLX."""
 
 
-def read_timeout_seconds(duration_sec: int, floor: float = 180.0) -> float:
-    """Read budget. Measured large-v3-turbo is about 16× realtime.
+def read_timeout_seconds(duration_sec: int) -> float:
+    """Wait in proportion to the measured length. No fixed cutoff.
 
-    Allow about 8× realtime plus 3 minutes. A 52 minute file (3091s) gets 566s;
-    the run that was cut at 180s had already reached 100% in 177s.
-    Unknown duration waits at least 10 minutes.
+    MLX large-v3-turbo is about 16× realtime. Waiting at 8× (twice as long)
+    is the whole budget: 3091s of audio → 386s. Unknown length → 0, caller stops.
     """
-    floor = float(floor) if floor and floor > 0 else 180.0
     if duration_sec <= 0:
-        return max(floor, 600.0)
-    return max(floor, duration_sec / 8.0 + 180.0)
+        return 0.0
+    return duration_sec / 8.0
 
 
 def allow_cpu_fallback(exc: BaseException, duration_sec: int) -> bool:
-    """CPU Whisper only for a short clip when MLX never started the job."""
-    if isinstance(exc, MlxTimedOut):
+    """Local Whisper only when MLX cannot be reached, and only for a short clip."""
+    if not isinstance(exc, MlxUnreachable):
         return False
     if duration_sec <= 0 or duration_sec > CPU_FALLBACK_MAX_SECONDS:
         return False

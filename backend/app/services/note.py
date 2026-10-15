@@ -672,27 +672,30 @@ class NoteGenerator:
         """片長。本地上傳以前寫死 0，逾時就會用 180 秒把 MLX 切斷。"""
         from app.transcriber.mlx_budget import probe_media_duration_seconds
 
-        duration_sec = 0
         audio_json = transcript_cache_file.with_name(f"{task_id}_audio.json")
         meta = {}
         try:
             if audio_json.exists():
                 meta = json.loads(audio_json.read_text(encoding="utf-8")) or {}
-                duration_sec = int(meta.get("duration") or 0)
         except Exception:
-            duration_sec = 0
             meta = {}
-        if duration_sec <= 0 and audio_file and Path(audio_file).exists():
+        duration_sec = 0
+        if audio_file and Path(audio_file).exists():
             duration_sec = probe_media_duration_seconds(audio_file)
-            if duration_sec > 0 and isinstance(meta, dict) and meta:
-                try:
-                    meta["duration"] = duration_sec
-                    audio_json.write_text(
-                        json.dumps(meta, ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                except Exception:
-                    logger.warning("寫回片長失敗", exc_info=True)
+        if duration_sec <= 0:
+            try:
+                duration_sec = int((meta or {}).get("duration") or 0)
+            except (TypeError, ValueError):
+                duration_sec = 0
+        if duration_sec > 0 and isinstance(meta, dict) and meta and int(meta.get("duration") or 0) != duration_sec:
+            try:
+                meta["duration"] = duration_sec
+                audio_json.write_text(
+                    json.dumps(meta, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                logger.warning("寫回片長失敗", exc_info=True)
         return duration_sec
 
     def _transcribe_audio(
@@ -712,17 +715,21 @@ class NoteGenerator:
         """
         task_id = transcript_cache_file.stem.split("_")[0]
         duration_sec = self._duration_seconds(task_id, transcript_cache_file, audio_file)
-        dur_min = max(1, duration_sec // 60) if duration_sec else None
-        # 实测 MLX large-v3-turbo ≈ 16× 实时（18.6 分钟片 ~69 秒）
-        mlx_eta = max(45, int(duration_sec / 12) + 20) if duration_sec else 90
-        if duration_sec > 30 * 60:
-            mlx_tail = "超過 30 分鐘不會改走本機 Whisper。"
-        else:
-            mlx_tail = "只有短片在 MLX 完全連不上時，才會改用本機 Whisper。"
+        if duration_sec <= 0:
+            exc = RuntimeError("未能從音檔讀到片長。已停止，不會改走本機 Whisper。")
+            self._handle_exception(task_id, exc)
+            raise exc
+        from app.transcriber.mlx_budget import read_timeout_seconds
+
+        wait_sec = int(read_timeout_seconds(duration_sec))
+        expect_sec = max(1, duration_sec // 16)
+        mins, secs = divmod(duration_sec, 60)
+        mlx_eta = expect_sec
         mlx_msg = (
-            "Pipeline：內網 MLX Whisper API（無字幕優先通道）。"
-            + (f" 影片約 {dur_min} 分鐘，" if dur_min else " ")
-            + f"預估轉寫約 {max(1, mlx_eta // 60)} 分鐘。{mlx_tail}"
+            f"音檔讀到 {mins} 分 {secs} 秒。"
+            f"內網 MLX 預計約 {expect_sec // 60} 分 {expect_sec % 60} 秒，"
+            f"等待上限 {wait_sec // 60} 分 {wait_sec % 60} 秒（片長÷8）。"
+            "逾時只會停止，不會改走本機 Whisper。"
         )
         self._update_status(
             task_id,
@@ -794,39 +801,37 @@ class NoteGenerator:
         from app.transcriber.mlx_api_transcriber import MlxApiTranscriber
         from app.transcriber.mlx_budget import (
             MlxTimedOut,
+            MlxUnreachable,
             allow_cpu_fallback,
             read_timeout_seconds,
         )
 
         mlx = MlxApiTranscriber()
         if mlx.available():
-            mlx.timeout = read_timeout_seconds(duration_sec, mlx.timeout)
+            mlx.timeout = read_timeout_seconds(duration_sec)
             try:
                 result = mlx.transcript(audio_file)
                 logger.info("MLX API 转写成功，跳过本机 Whisper")
                 return result
             except Exception as exc:
                 if not allow_cpu_fallback(exc, duration_sec):
-                    dur = (
-                        f"片長約 {max(1, duration_sec // 60)} 分鐘。"
-                        if duration_sec
-                        else "未能讀到片長。"
-                    )
                     if isinstance(exc, MlxTimedOut):
                         reason = (
-                            f"內網 MLX 已在轉寫，等待上限 {int(mlx.timeout)} 秒到了，結果沒有寫回。"
-                            f"{dur}已停止，不會改走本機 Whisper。"
+                            f"內網 MLX 仍在運作，等待上限 {int(mlx.timeout)} 秒到了。"
+                            "快捷方式沒有壞，已停止，不會改走本機 Whisper。"
                         )
-                    elif duration_sec > 30 * 60:
+                    elif isinstance(exc, MlxUnreachable):
                         reason = (
-                            f"內網 MLX 沒有寫回結果。{dur}"
-                            "超過 30 分鐘，已停止，不會改走本機 Whisper。"
+                            "內網 MLX 連不上。這條片不會改走本機 Whisper。"
                         )
                     else:
-                        reason = f"內網 MLX 沒有寫回結果。{dur}已停止，不會改走本機 Whisper。"
+                        reason = (
+                            "內網 MLX 有回應，但這次結果沒有寫回。"
+                            "快捷方式沒有壞，已停止，不會改走本機 Whisper。"
+                        )
                     logger.warning(reason)
                     raise RuntimeError(reason) from exc
-                logger.warning(f"MLX API 转写失败，短片 fallback 本机 Whisper: {exc}")
+                logger.warning(f"MLX 連不上，短片才改用本機 Whisper: {exc}")
         elif duration_sec <= 0 or duration_sec > 30 * 60:
             dur = (
                 f"片長約 {max(1, duration_sec // 60)} 分鐘。"
@@ -845,7 +850,7 @@ class NoteGenerator:
         eta = max(180, int(duration_sec * factor)) if duration_sec else 900
         dur_min = max(1, duration_sec // 60) if duration_sec else None
         whisper_msg = (
-            "內網 MLX 連不上，短片改用本機 Whisper。"
+            "內網 MLX 連不上，這條短片才改用本機 Whisper。"
             f" Pipeline：本機 Whisper medium（CPU，{threads} 核）。"
             + (f" 影片約 {dur_min} 分鐘，" if dur_min else " ")
             + f"預估轉寫 {max(1, eta // 60)} 分鐘。"

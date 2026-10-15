@@ -10,7 +10,12 @@ import requests
 
 from app.models.transcriber_model import TranscriptResult, TranscriptSegment
 from app.transcriber.base import Transcriber
-from app.transcriber.mlx_budget import MlxTimedOut, MlxUnreachable
+from app.transcriber.mlx_budget import (
+    MlxTimedOut,
+    MlxUnreachable,
+    probe_media_duration_seconds,
+    read_timeout_seconds,
+)
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -42,7 +47,11 @@ class MlxApiTranscriber(Transcriber):
         if not path.exists():
             raise FileNotFoundError(file_path)
 
-        read_timeout = self.timeout
+        duration_sec = probe_media_duration_seconds(str(path))
+        if duration_sec <= 0:
+            raise RuntimeError("未能從音檔讀到片長，已停止。")
+        read_timeout = read_timeout_seconds(duration_sec)
+        self.timeout = read_timeout
         logger.info(
             f"MLX API 转写: {self.endpoint} file={path.name} "
             f"connect_timeout=10s read_timeout={read_timeout:.0f}s"
