@@ -33,11 +33,8 @@ def read_timeout_seconds(duration_sec: int) -> float:
 
 
 def allow_cpu_fallback(exc: BaseException, duration_sec: int) -> bool:
-    """Local Whisper only when MLX cannot be reached, and only for a short clip."""
-    if not isinstance(exc, MlxUnreachable):
-        return False
-    if duration_sec <= 0 or duration_sec > CPU_FALLBACK_MAX_SECONDS:
-        return False
+    """The fast path did not deliver a transcript, so the slow path still runs."""
+    del exc, duration_sec
     return True
 
 

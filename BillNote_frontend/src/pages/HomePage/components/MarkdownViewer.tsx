@@ -465,7 +465,7 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
               : isMlx
                 ? '內網 MLX'
                 : isSlow
-                  ? '本機 Whisper（MLX 連不上的短片）'
+                  ? '本機 Whisper（快方案沒有交到結果）'
                   : '正在選擇處理方案…'}
           </p>
           <div
@@ -485,8 +485,8 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
             <div className="mt-1 whitespace-pre-wrap">
               {liveMsg ||
                 (isSlow
-                  ? 'MLX 連不上，這條短片才用本機 Whisper。大約比 MLX 慢二十倍。'
-                  : '有字幕用字幕；否則用內網 MLX。逾時會停止，不會自動改走慢路。')}
+                  ? '快方案沒有交到結果，改走本機 Whisper。大約比 MLX 慢二十倍。'
+                  : '有字幕用字幕；否則用內網 MLX。交唔到結果就改走本機 Whisper。')}
             </div>
           </div>
         </div>

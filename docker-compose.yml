@@ -20,8 +20,8 @@ services:
       - OMP_NUM_THREADS=${WHISPER_CPU_THREADS:-3}
       - OPENBLAS_NUM_THREADS=${WHISPER_CPU_THREADS:-3}
       - MKL_NUM_THREADS=${WHISPER_CPU_THREADS:-3}
-      # 内网 MLX Whisper（不出公网）。等待时间 = ffprobe 片长 / 8，不用固定秒数。
-      # 本机 Whisper 只在 MLX 连不上、而且片长不超过 30 分钟时才走。
+      # 内网 MLX Whisper（不出公网）。等待时间 = ffprobe 片长 / 8（预计时间再加一倍）。
+      # MLX 交不到结果时仍走本机 Whisper，不把任务停成没有笔记。
       - MLX_WHISPER_API_URL=${MLX_WHISPER_API_URL:-http://192.168.8.18:8000}
       - MLX_WHISPER_MODEL=${MLX_WHISPER_MODEL:-mlx-community/whisper-large-v3-turbo}
     volumes:

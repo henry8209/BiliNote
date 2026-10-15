@@ -743,7 +743,7 @@ class NoteGenerator:
             except Exception as e:
                 logger.warning(f"加载转写缓存失败，将重新转写：{e}")
 
-        # 無字幕：MLX。只有連不上而且片長不超過 30 分鐘，才改走本機 Whisper。
+        # 無字幕：先 MLX。交唔到結果就改走本機 Whisper，唔好停低冇筆記。
         try:
             logger.info("开始转写音频")
             transcript = self._transcript_with_fallback(
@@ -788,7 +788,7 @@ class NoteGenerator:
         status_phase: TaskStatus,
         duration_sec: int,
     ) -> TranscriptResult | None:
-        """無字幕的轉寫。慢路只在 MLX 連不上、而且片長不超過 30 分鐘時發生。"""
+        """無字幕的轉寫。MLX 交唔到結果時，改走本機 Whisper。"""
         from app.services.transcript_route import Route, after_mlx, without_mlx
         from app.transcriber.mlx_api_transcriber import MlxApiTranscriber
 
