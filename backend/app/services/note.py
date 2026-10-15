@@ -714,33 +714,24 @@ class NoteGenerator:
         :return: TranscriptResult 对象
         """
         task_id = transcript_cache_file.stem.split("_")[0]
+        from app.services.transcript_route import Route, mlx_start
+
         duration_sec = self._duration_seconds(task_id, transcript_cache_file, audio_file)
-        if duration_sec <= 0:
-            exc = RuntimeError("未能從音檔讀到片長。已停止，不會改走本機 Whisper。")
+        started = mlx_start(duration_sec)
+        if started.route == Route.STOP:
+            exc = RuntimeError(started.message)
             self._handle_exception(task_id, exc)
             raise exc
-        from app.transcriber.mlx_budget import read_timeout_seconds
-
-        wait_sec = int(read_timeout_seconds(duration_sec))
-        expect_sec = max(1, duration_sec // 16)
-        mins, secs = divmod(duration_sec, 60)
-        mlx_eta = expect_sec
-        mlx_msg = (
-            f"音檔讀到 {mins} 分 {secs} 秒。"
-            f"內網 MLX 預計約 {expect_sec // 60} 分 {expect_sec % 60} 秒，"
-            f"等待上限 {wait_sec // 60} 分 {wait_sec % 60} 秒（片長÷8）。"
-            "逾時只會停止，不會改走本機 Whisper。"
-        )
         self._update_status(
             task_id,
             status_phase,
-            message=mlx_msg,
-            pipeline="mlx_whisper_api",
-            pipeline_label="內網 MLX Whisper（無字幕快通道）",
-            eta_seconds=mlx_eta,
-            video_duration_seconds=duration_sec or None,
+            message=started.message,
+            pipeline=started.pipeline,
+            pipeline_label=started.pipeline_label,
+            eta_seconds=started.eta_seconds,
+            video_duration_seconds=duration_sec,
         )
-        logger.info(mlx_msg)
+        logger.info(started.message)
 
         # 已有缓存，尝试加载
         if transcript_cache_file.exists():
@@ -752,7 +743,7 @@ class NoteGenerator:
             except Exception as e:
                 logger.warning(f"加载转写缓存失败，将重新转写：{e}")
 
-        # 调用转写器：优先内网 MLX API，失败再 fallback 本机 Whisper
+        # 無字幕：MLX。只有連不上而且片長不超過 30 分鐘，才改走本機 Whisper。
         try:
             logger.info("开始转写音频")
             transcript = self._transcript_with_fallback(
@@ -797,71 +788,40 @@ class NoteGenerator:
         status_phase: TaskStatus,
         duration_sec: int,
     ) -> TranscriptResult | None:
-        """無字幕：先打內網 MLX。讀取逾時或片長超過 30 分鐘時停住，不開本機 Whisper。"""
+        """無字幕的轉寫。慢路只在 MLX 連不上、而且片長不超過 30 分鐘時發生。"""
+        from app.services.transcript_route import Route, after_mlx, without_mlx
         from app.transcriber.mlx_api_transcriber import MlxApiTranscriber
-        from app.transcriber.mlx_budget import (
-            MlxTimedOut,
-            MlxUnreachable,
-            allow_cpu_fallback,
-            read_timeout_seconds,
-        )
-
-        mlx = MlxApiTranscriber()
-        if mlx.available():
-            mlx.timeout = read_timeout_seconds(duration_sec)
-            try:
-                result = mlx.transcript(audio_file)
-                logger.info("MLX API 转写成功，跳过本机 Whisper")
-                return result
-            except Exception as exc:
-                if not allow_cpu_fallback(exc, duration_sec):
-                    if isinstance(exc, MlxTimedOut):
-                        reason = (
-                            f"內網 MLX 仍在運作，等待上限 {int(mlx.timeout)} 秒到了。"
-                            "快捷方式沒有壞，已停止，不會改走本機 Whisper。"
-                        )
-                    elif isinstance(exc, MlxUnreachable):
-                        reason = (
-                            "內網 MLX 連不上。這條片不會改走本機 Whisper。"
-                        )
-                    else:
-                        reason = (
-                            "內網 MLX 有回應，但這次結果沒有寫回。"
-                            "快捷方式沒有壞，已停止，不會改走本機 Whisper。"
-                        )
-                    logger.warning(reason)
-                    raise RuntimeError(reason) from exc
-                logger.warning(f"MLX 連不上，短片才改用本機 Whisper: {exc}")
-        elif duration_sec <= 0 or duration_sec > 30 * 60:
-            dur = (
-                f"片長約 {max(1, duration_sec // 60)} 分鐘。"
-                if duration_sec
-                else "未能讀到片長。"
-            )
-            raise RuntimeError(f"未設定內網 MLX。{dur}已停止，不會改走本機 Whisper。")
-        else:
-            logger.info("未配置 MLX_WHISPER_API_URL，短片直接本机 Whisper")
 
         try:
             threads = int(os.getenv("WHISPER_CPU_THREADS", "3"))
         except ValueError:
             threads = 3
-        factor = 1.7 if threads <= 2 else (1.45 if threads == 3 else 1.35)
-        eta = max(180, int(duration_sec * factor)) if duration_sec else 900
-        dur_min = max(1, duration_sec // 60) if duration_sec else None
-        whisper_msg = (
-            "內網 MLX 連不上，這條短片才改用本機 Whisper。"
-            f" Pipeline：本機 Whisper medium（CPU，{threads} 核）。"
-            + (f" 影片約 {dur_min} 分鐘，" if dur_min else " ")
-            + f"預估轉寫 {max(1, eta // 60)} 分鐘。"
-        )
+
+        mlx = MlxApiTranscriber()
+        decision = None
+        if mlx.available():
+            try:
+                result = mlx.transcript(audio_file)
+                logger.info("MLX API 转写成功")
+                return result
+            except Exception as exc:
+                decision = after_mlx(exc, duration_sec, threads)
+                if decision.route == Route.STOP:
+                    logger.warning(decision.message)
+                    raise RuntimeError(decision.message) from exc
+                logger.warning(decision.message)
+        else:
+            decision = without_mlx(duration_sec, threads)
+            if decision.route == Route.STOP:
+                raise RuntimeError(decision.message)
+
         self._update_status(
             task_id,
             status_phase,
-            message=whisper_msg,
-            pipeline="whisper_cpu",
-            pipeline_label="本機 Whisper CPU（fallback）",
-            eta_seconds=eta,
+            message=decision.message,
+            pipeline=decision.pipeline,
+            pipeline_label=decision.pipeline_label,
+            eta_seconds=decision.eta_seconds,
             video_duration_seconds=duration_sec or None,
         )
         return self.transcriber.transcript(file_path=audio_file)

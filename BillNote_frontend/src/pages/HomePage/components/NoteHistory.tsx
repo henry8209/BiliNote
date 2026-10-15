@@ -139,7 +139,7 @@ const NoteHistory: FC<NoteHistoryProps> = ({ onSelect, selectedId }) => {
                       : task.pipeline === 'mlx_whisper_api'
                         ? '方案B MLX'
                         : task.pipeline === 'whisper_cpu'
-                          ? '方案C Whisper'
+                          ? '慢路 Whisper'
                           : '處理中'}
                   </div>
                 ) : (

@@ -47,13 +47,13 @@ export const useTaskPolling = (interval = 3000) => {
               const etaMin = etaSeconds ? Math.max(1, Math.round(Number(etaSeconds) / 60)) : null
               const etaText = etaMin ? `預估約 ${etaMin} 分鐘。` : ''
               if (pipeline === 'whisper_cpu') {
-                toast(`方案 C｜本機 Whisper CPU（fallback）。${etaText}請勿關閉頁面。`, {
+                toast(`本機 Whisper。MLX 連不上，而且這條片不超過 30 分鐘。${etaText}這條路大約慢二十倍。`, {
                   duration: 12000,
                 })
               } else if (pipeline === 'mlx_whisper_api') {
-                toast.success(`方案 B｜內網 MLX Whisper（不出公網）。${etaText || '通常約 1–2 分鐘。'}`)
+                toast.success(`內網 MLX。${etaText || '按片長估算。'}逾時會停止，不會改走慢路。`)
               } else {
-                toast.success(`方案 A｜平台字幕。${etaText || '約 1–2 分鐘。'}`)
+                toast.success(`平台字幕。${etaText || '約 1–2 分鐘。'}`)
               }
             }
             if (status === 'SUCCESS') {

@@ -461,11 +461,11 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
         <div className="text-center text-sm max-w-md px-4">
           <p className="text-lg font-bold">
             {isFast
-              ? '方案 A｜平台字幕（快通道）'
+              ? '平台字幕'
               : isMlx
-                ? '方案 B｜內網 MLX Whisper（無字幕，不出公網）'
+                ? '內網 MLX'
                 : isSlow
-                  ? '方案 C｜本機 Whisper CPU（fallback）'
+                  ? '本機 Whisper（MLX 連不上的短片）'
                   : '正在選擇處理方案…'}
           </p>
           <div
@@ -485,8 +485,8 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
             <div className="mt-1 whitespace-pre-wrap">
               {liveMsg ||
                 (isSlow
-                  ? '無字幕，本機 Whisper medium（CPU，最多 2 核）。唔會係 60 秒完成。'
-                  : '有字幕時約 1–2 分鐘；無字幕會改走 Whisper 慢通道。')}
+                  ? 'MLX 連不上，這條短片才用本機 Whisper。大約比 MLX 慢二十倍。'
+                  : '有字幕用字幕；否則用內網 MLX。逾時會停止，不會自動改走慢路。')}
             </div>
           </div>
         </div>
